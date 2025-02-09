@@ -9,8 +9,11 @@
 
 ## 核心功能
 ✅ 实时流式内容生成与逐字渲染
+
 ✅ websocket心跳检测与自动重连
+
 ✅ Markdown语法高亮与格式渲染  
+
 ✅ 模型参数动态配置：
    - 修改`server/model.py`中的：
    ```python
