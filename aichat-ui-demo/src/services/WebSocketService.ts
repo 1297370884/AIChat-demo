@@ -5,6 +5,7 @@ import { ref, computed} from 'vue';
 export interface MessageSender {
   text: string;
   sender: 'user' | 'ai' | 'system';
+  stream_id?: string;
 }
 
 export class WebSocketService {
@@ -14,6 +15,9 @@ export class WebSocketService {
   private aiMessageTimeout: any = null; // 用于检测流式响应结束
   public messages = ref<MessageSender[]>([]);
   public isConnected = ref(false);
+  private heartbeatTimer: any = null;
+  private lastActivity = 0;
+  private readonly HEARTBEAT_TIMEOUT = 65000; // 65秒
 
   public async connect(): Promise<void> {
     this.ws = new WebSocket('ws://localhost:8000/ws');
@@ -25,13 +29,18 @@ export class WebSocketService {
 
   public sendMessage(message: string): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(message);
+      this.ws.send(JSON.stringify({
+        type: "user",
+        content: message,
+        timestamp: Date.now()
+      }));
     } else {
       this.messageQueue.push(message);
     }
   }
 
   private onOpen = (): void => {
+    this.resetHeartbeat();
     this.isConnected.value = true;
     console.log('WebSocket connected');
     this.messageQueue.forEach((msg) => this.ws?.send(msg));
@@ -39,9 +48,30 @@ export class WebSocketService {
   }
 
   private onMessage = (event: MessageEvent): void => {
+    this.resetHeartbeat();
+    // if (!event.data || typeof event.data !== 'string') {
+    //   console.warn('收到非文本消息:', event.data);
+    //   return;
+    // }
+
     try {
-      const data = JSON.parse(event.data);
-      
+      const rawData = event.data.toString().trim();
+
+      // 打印原始消息（生产环境可注释掉）
+      // console.debug('收到原始消息:', rawData);
+
+      if (!rawData.startsWith('{') || !rawData.endsWith('}')) {
+        // console.warn('收到非JSON消息:', rawData);
+        return;
+      }
+
+      const data = JSON.parse(rawData);
+
+      // 格式化输出消息内容（开发环境专用）
+      // console.groupCollapsed(`[WS消息] 类型: ${data.type}`);
+      // console.log('完整消息内容:', JSON.stringify(data, null, 2));
+      // console.groupEnd();
+
       switch(data.type) {
         case 'stream_start':
           this.handleStreamStart(data.stream_id);
@@ -56,7 +86,17 @@ export class WebSocketService {
           this.messages.value.push({ text: data.content, sender: 'system' });
           break;
         case 'error':
-          this.messages.value.push({ text: data.content, sender: 'system' });
+          this.messages.value.push({
+            text: `系统错误: ${data.content}`,
+            sender: 'system',
+            stream_id: data.stream_id || 'system'
+          });
+          break;
+        case 'heartbeat_ping':
+          this.handleHeartbeat(data);
+          break;
+        case 'heartbeat_pong':
+          this.updateLastActivity();
           break;
       }
     } catch (error) {
@@ -67,6 +107,7 @@ export class WebSocketService {
   private activeStreams: Map<string, {
     buffer: string;
     elementIndex: number;
+    animationFrame: number | null;
   }> = new Map();
 
   private handleStreamStart(streamId: string) {
@@ -76,10 +117,11 @@ export class WebSocketService {
       sender: 'ai'
     };
     this.messages.value.push(newMessage);
-    
+
     this.activeStreams.set(streamId, {
       buffer: '',
-      elementIndex: this.messages.value.length - 1
+      elementIndex: this.messages.value.length - 1,
+      animationFrame: null
     });
   }
 
@@ -88,26 +130,29 @@ export class WebSocketService {
     if (!stream) return;
 
     stream.buffer += content;
-    
-    // 实时更新消息内容（带打字机效果）
-    this.updateStreamContent(streamId);
+
+    if (!stream.animationFrame) {
+      stream.animationFrame = requestAnimationFrame(() => {
+        this.updateStreamContent(streamId);
+        stream.animationFrame = null;
+      });
+    }
   }
 
   private updateStreamContent(streamId: string) {
     const stream = this.activeStreams.get(streamId);
     if (!stream) return;
 
-    // 使用动画帧优化渲染
-    requestAnimationFrame(() => {
-      const messages = [...this.messages.value];
-      messages[stream.elementIndex].text = this.applyTypingEffect(stream.buffer);
-      this.messages.value = messages;
-    });
-  }
+    const messages = [...this.messages.value];
+    const currentText = messages[stream.elementIndex].text;
 
-  private applyTypingEffect(text: string): string {
-    // 这里可以添加打字机效果逻辑
-    return text; // 暂时直接返回
+    const targetText = stream.buffer;
+    const chunk = targetText.slice(currentText.length);
+
+    if (chunk) {
+      messages[stream.elementIndex].text = currentText + chunk;
+      this.messages.value = messages;
+    }
   }
 
   private handleStreamEnd(streamId: string) {
@@ -129,6 +174,39 @@ export class WebSocketService {
 
   private onError = (error: Event): void => {
     console.error('WebSocket error:', error);
+  }
+
+  private handleHeartbeat(data: any) {
+    // 添加心跳日志
+    console.debug(`收到心跳ping: ${data.timestamp}`);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+            type: 'heartbeat_pong',
+            timestamp: data.timestamp
+        }));
+        console.debug(`发送心跳pong: ${data.timestamp}`);
+    }
+  }
+
+  private updateLastActivity() {
+    // 更新最后活动时间
+  }
+
+  private checkConnection() {
+    if (!this.isConnected.value && this.ws?.readyState === WebSocket.OPEN) {
+      this.isConnected.value = true;
+    }
+  }
+
+  private resetHeartbeat() {
+    this.lastActivity = Date.now();
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+    }
+    this.heartbeatTimer = setTimeout(() => {
+      console.warn('心跳超时，主动断开连接');
+      this.ws?.close();
+    }, this.HEARTBEAT_TIMEOUT);
   }
 }
 
